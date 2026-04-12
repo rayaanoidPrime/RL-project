@@ -50,7 +50,7 @@ After running `bash setup_local.sh` the project looks like this:
 
 ## Completed work (do not redo)
 
-1. `setup_local.sh` — uv environment + repo clone
+1. `setup_local.sh` — uv environment; paper repo is a git submodule at distributionally_robust_dpo/
 2. `modal_jobs.py` — Modal functions wrapping every paper experiment
 3. `.env.example` — token template
 
@@ -61,9 +61,11 @@ After running `bash setup_local.sh` the project looks like this:
 ### TASK 1 — Create a Modal secret for HuggingFace
 
 Run this once to register the HF token with Modal:
+
 ```bash
 modal secret create huggingface-secret HF_TOKEN=<the_token_from_.env>
 ```
+
 If this is already done, skip it.
 
 ---
@@ -72,11 +74,13 @@ If this is already done, skip it.
 
 Run the smoke test to make sure the Docker image builds correctly and all
 imports work:
+
 ```bash
 modal run modal_jobs.py::smoke_test
 ```
 
 If it fails, debug the image build in `modal_jobs.py`. Common issues:
+
 - `flash-attn` build failures: pin to a wheel that matches torch 2.5.1 + cu124.
   Try: `flash-attn==2.7.2.post1` or fetch the correct wheel from
   https://github.com/Dao-AILab/flash-attention/releases
@@ -97,10 +101,7 @@ Do NOT change the paper's `src/` files to fix image issues.
 modal run modal_jobs.py::download_assets
 ```
 
-This calls the paper's `src/setup.py`. If that file doesn't exist in the
-cloned repo (it may not be public), create a minimal replacement at
-`distributionally_robust_dpo/src/setup.py` that does the following and
-nothing else:
+This calls the paper's `src/setup.py`. If that file doesn't exist in the submodule (distributionally_robust_dpo/src/setup.py), create it there — but do not commit that file to the submodule. Instead place it in a patches/setup.py at the root and have Modal copy it in during the image build. This file should do the following and nothing else:
 
 ```python
 # Minimal setup.py — only create this if the paper's version is missing.
@@ -141,6 +142,7 @@ been granted access at https://huggingface.co/meta-llama
 ### TASK 4 — Run the ArmoRM multi-objective experiment (Figure 3)
 
 Execute in order:
+
 ```bash
 modal run modal_jobs.py::generate_completions_1b_armo
 modal run modal_jobs.py::generate_preferences_armo_plot1
@@ -158,6 +160,7 @@ The `modal_jobs.py` `_train()` helper currently hardcodes `--max_epochs 8`
 signatures, defaulting to 8 for leaderboard and 4 for ArmoRM.
 
 For each of plot1 / plot2 / plot3:
+
 ```bash
 # DPO
 modal run modal_jobs.py::train_dpo_1b_armo --dataset-path datasets/helpsteer2_prefs_armo_plot1
@@ -169,6 +172,7 @@ modal run modal_jobs.py::train_wdpo_1b_armo --dataset-path datasets/helpsteer2_p
 
 **Note on hyperparameters:** The ArmoRM experiment uses different tau/rho ranges
 than the leaderboard experiment. Inspect the paper's Figure 2 caption:
+
 - KLDPO tau ∈ {0.5, 0.75, 1.0} for Emotion; tau ∈ {0.005, 0.01} for leaderboard
 - WDPO rho ∈ {50, 75, 100} for Emotion; rho ∈ {0.005, 0.01} for leaderboard
 
@@ -194,10 +198,12 @@ modal run modal_jobs.py::train_wdpo_1b --rho 0.01
 The paper's DPO is evaluated at epoch 2 (early stopping) and epoch 4.
 `train_alignment.sh` saves checkpoints every 158 steps (`--save_steps 158`).
 After 8 epochs with batch_size=128 on ~10K preference pairs:
+
 - Epoch 2 ≈ global_step_158
 - Epoch 4 ≈ global_step_316
 
 Evaluate:
+
 ```bash
 modal run modal_jobs.py::eval_leaderboard --model-path outputs/llama1b_dpo/global_step_158
 modal run modal_jobs.py::eval_leaderboard --model-path outputs/llama1b_kldpo_tau0.05/global_step_158
@@ -205,6 +211,7 @@ modal run modal_jobs.py::eval_leaderboard --model-path outputs/llama1b_wdpo_rho0
 ```
 
 Repeat for 3B:
+
 ```bash
 # Generate 3B completions (can reuse leaderboard dataset from 1B run
 # IF the dataset is model-agnostic — check generate_completions.py)
@@ -214,6 +221,7 @@ modal run modal_jobs.py::eval_leaderboard --model-path outputs/llama3b_kldpo_tau
 ```
 
 8B (KLDPO only):
+
 ```bash
 modal run modal_jobs.py::train_kldpo_8b --tau 0.005
 modal run modal_jobs.py::eval_leaderboard --model-path outputs/llama8b_kldpo_tau0.005/global_step_158
@@ -269,9 +277,11 @@ script ran and that the volume was not re-mounted at a different path.
 **Flash attention:**
 `flash-attn` must be compiled against the exact torch + CUDA version.
 If the pip install fails, fetch the pre-built wheel directly:
+
 ```
 https://github.com/Dao-AILab/flash-attention/releases
 ```
+
 Find the wheel matching `torch2.5.1`, `cu124`, `cp311`. Add it to the
 Modal image as `.pip_install("<wheel_url>")`.
 
@@ -294,11 +304,11 @@ of the image definition, not in the middle (later layers cache independently).
 Rough cost estimates (Modal, April 2026 pricing):
 | Job | GPU | Time | Est. cost |
 |---|---|---|---|
-| smoke_test | A10G ×1 | 5 min | ~$0.05 |
+| smoke*test | A10G ×1 | 5 min | ~$0.05 |
 | download_assets | A10G ×1 | 60 min | ~$0.50 |
 | generate_completions (×2 best_of_n=10) | A10G ×1 | 4 hr | ~$2 |
-| train_*_1b | A100 80GB ×4 | 5 hr | ~$20 |
-| train_*_3b | A100 80GB ×4 | 10 hr | ~$40 |
+| train*_*1b | A100 80GB ×4 | 5 hr | ~$20 |
+| train*_\_3b | A100 80GB ×4 | 10 hr | ~$40 |
 | train_kldpo_8b | H100 ×8 | 18 hr | ~$150 |
 | eval_leaderboard | A100 80GB ×4 | 8 hr | ~$32 |
 
