@@ -50,64 +50,209 @@ VOLUME_MOUNT = "/vol"
 # Base image: CUDA 12.4 + Python 3.11, matches paper's requirements exactly.
 # We install the paper's conda env dependencies via pip instead of conda
 # because Modal images don't use conda — they use pip on top of a CUDA base.
+# BASE_IMAGE = (
+#     modal.Image.from_registry(
+#         "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04",
+#         add_python="3.11",
+#     )
+
+#     # ---------------- SYSTEM ----------------
+#     .apt_install(
+#         "git", "wget", "curl",
+#         "build-essential",
+#         "ninja-build",
+#         "pkg-config",
+#         "libssl-dev",
+#         "libffi-dev",
+#     )
+
+#     # ---------------- TORCH (matches paper) ----------------
+#     .pip_install(
+#         "torch==2.5.1+cu124",
+#         "torchvision",
+#         "torchaudio",
+#         extra_index_url="https://download.pytorch.org/whl/cu124",
+#     )
+
+#     # ---------------- CORE STACK ----------------
+#     .pip_install(
+#         "transformers==4.48.3",
+#         "accelerate",
+#         "datasets",
+#         "huggingface_hub",
+#         "tqdm",
+#         "pandas",
+#         "numpy",
+#     )
+
+#     # ---------------- DEEPSPEED (NO SOURCE BUILD) ----------------
+#     # paper builds from source, but this is the closest stable equivalent
+#     .pip_install("deepspeed==0.16.4")
+
+#     # ---------------- CRITICAL FIX ----------------
+#     # install openrlhf WITHOUT triggering flash-attn build
+#     .run_commands(
+#         "pip install openrlhf==0.6.1.post1 --no-deps"
+#     )
+
+#     # ---------------- SAFE DEPENDENCIES ----------------
+#     .pip_install(
+#         "peft",
+#         "optimum",
+#         "wandb",
+#         "tensorboard",
+#         "torchmetrics",
+#         "bitsandbytes",
+#     )
+
+#     # ---------------- OPTIONAL (vllm, safer than openrlhf[vllm]) ----------------
+#     .pip_install("vllm==0.6.3")
+
+#     # ---------------- LM EVAL ----------------
+#     .run_commands(
+#         "git clone https://github.com/EleutherAI/lm-evaluation-harness /tmp/lm-eval",
+#         "cd /tmp/lm-eval && git checkout 19ba1b16fef9fa6354a3e4ef3574bb1d03552922 && pip install -e .",
+#         "rm -rf /tmp/lm-eval",
+#     )
+
+#     # ---------------- REPO ----------------
+#     .run_commands(
+#         "git clone https://github.com/TheBlackCat22/distributionally_robust_dpo /repo",
+#     )
+
+#     .env({
+#         "PYTHONPATH": "/repo",
+#         "VLLM_CONFIGURE_LOGGING": "0",
+#     })
+# )
 BASE_IMAGE = (
     modal.Image.from_registry(
         "nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04",
         add_python="3.11",
     )
+ 
+    # ── System packages ────────────────────────────────────────
+    # gcc-12 (not gcc-11 from build-essential) for better CUDA 12.4
+    # compat. gcc-13 needs a PPA which Modal's apt_install can't add,
+    # so gcc-12 is the highest available in Ubuntu 22.04's default repos.
+    # libstdc++-12-dev: C++17 STL headers DeepSpeed fused kernels need.
+    # libnccl-dev: available from NVIDIA's repo pre-configured in base image.
     .apt_install(
-        "git", "wget", "curl", "build-essential", "ninja-build",
-        "libssl-dev", "libffi-dev",
+        "git", "wget", "curl",
+        "build-essential",
+        "gcc-12", "g++-12",
+        "libstdc++-12-dev",
+        "ninja-build",
+        "pkg-config",
+        "libssl-dev",
+        "libffi-dev",
     )
-    # Torch first (matches paper's torch==2.5.1 + cu124)
+ 
+    # ── Set gcc-12 as the default compiler ────────────────────
+    .run_commands(
+        "update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100",
+        "update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 100",
+        "update-alternatives --install /usr/bin/cc  cc  /usr/bin/gcc-12 100",
+    )
+ 
+    # ── Environment (set BEFORE DeepSpeed build) ──────────────
+    # TORCH_CUDA_ARCH_LIST: without this, nvcc can't detect GPU arch
+    #   during `docker build` (no GPU attached) and the kernel
+    #   compilation silently fails or errors out. Covers V100→H100.
+    # NVCC_PREPEND_FLAGS: explicitly points nvcc at gcc-12 to avoid
+    #   host-compiler detection failures.
+    .env({
+        "CUDA_HOME": "/usr/local/cuda",
+        # Force gcc-12 as host compiler for ALL C/C++ extension builds.
+        # Modal's add_python="3.11" ships a Python binary compiled with clang.
+        # torch.utils.cpp_extension detects the Python compiler and tries to
+        # use clang -- but clang is not installed, crashing with
+        # "command 'clang' failed: No such file or directory".
+        # CC/CXX override that detection and pin gcc-12 explicitly.
+        "CC": "/usr/bin/gcc-12",
+        "CXX": "/usr/bin/g++-12",
+        "TORCH_CUDA_ARCH_LIST": "7.0 7.5 8.0 8.6 9.0+PTX",
+        "NVCC_PREPEND_FLAGS": "-ccbin /usr/bin/gcc-12",
+        "PYTHONPATH": "/repo",
+        "VLLM_CONFIGURE_LOGGING": "0",
+    })
+ 
+    # ── Build tooling (must come before DeepSpeed) ────────────
+    # packaging: DeepSpeed's setup.py imports it at the top level.
+    # wheel: required to produce installable artifacts during build.
+    .pip_install(
+        "packaging>=23.0",
+        "wheel>=0.43",
+        "ninja>=1.11",
+    )
+ 
+    # ── PyTorch 2.5.1 + CUDA 12.4 ────────────────────────────
     .pip_install(
         "torch==2.5.1",
         extra_index_url="https://download.pytorch.org/whl/cu124",
     )
-    # DeepSpeed with fused kernels (matches paper's DS v0.16.4)
+ 
+    # ── DeepSpeed from source with CUDA extensions ────────────
+    # MAX_JOBS=4: caps parallel compiler procs so the build doesn't
+    #   OOM-kill itself (Modal build containers have limited RAM).
+    #   Raise to 8 if builds fail with exit code 137 (OOM).
+    # DS_BUILD_FUSED_ADAM + DS_BUILD_UTILS match the original script.
     .run_commands(
-        "git clone https://github.com/microsoft/DeepSpeed.git --branch v0.16.4 -c advice.detachedHead=false /tmp/DeepSpeed",
-        "cd /tmp/DeepSpeed && DS_BUILD_UTILS=1 DS_BUILD_FUSED_ADAM=1 pip install . && cd / && rm -rf /tmp/DeepSpeed",
+        "git clone https://github.com/microsoft/DeepSpeed.git"
+        " --branch v0.16.4 --depth 1 -c advice.detachedHead=false",
+        # --no-build-isolation: pip normally builds wheels in a fresh
+        # isolated venv that doesn't inherit installed packages. DeepSpeed's
+        # setup.py does `import torch` at the top to detect GPU arch and
+        # select which ops to compile — without this flag, torch is invisible
+        # in the isolated env and the build crashes immediately.
+        "cd DeepSpeed && MAX_JOBS=4 DS_BUILD_UTILS=1 DS_BUILD_FUSED_ADAM=1"
+        " pip install --no-cache-dir --no-build-isolation . && cd ..",
+        "rm -rf DeepSpeed",
     )
-    # OpenRLHF (paper uses openrlhf[vllm]==0.6.1.post1)
-    .pip_install("openrlhf[vllm]==0.6.1.post1")
-    # LM Evaluation Harness pinned to paper's commit
-    .run_commands(
-        "git clone https://github.com/EleutherAI/lm-evaluation-harness /tmp/lm-evaluation-harness",
-        "cd /tmp/lm-evaluation-harness && git checkout 19ba1b16fef9fa6354a3e4ef3574bb1d03552922 && pip install -e '.[math]' && cd / && rm -rf /tmp/lm-evaluation-harness",
-    )
-    # Additional utilities
+ 
+
+    # ── OpenRLHF (no flash-attn build, matches your original) ─
+    .run_commands("pip install --no-build-isolation openrlhf[vllm]==0.6.1.post1")
+   
+ 
+    # ── Re-pin torch after vLLM (may have downgraded it) ──────
     .pip_install(
-        "huggingface_hub",
-        "accelerate",
-        "transformers",
-        "datasets",
-        "pandas",
-        "numpy",
-        "matplotlib",
-        "scikit-learn",
-        "tqdm",
-        "flash-attn==2.7.2.post1",  # flash attention for training
+        "torch==2.5.1",
+        extra_index_url="https://download.pytorch.org/whl/cu124",
     )
-    # Clone the paper's repo into the image
+ 
+    # ── LM Evaluation Harness (pinned commit, math extras) ────
+    # BUG FIX: your original used `pip install -e .` then `rm -rf`.
+    # Editable installs symlink to the source dir — deleting the dir
+    # breaks all imports at runtime. Regular install is safe to delete.
+    .run_commands(
+        "git clone https://github.com/EleutherAI/lm-evaluation-harness /tmp/lm-eval",
+        "cd /tmp/lm-eval && git checkout 19ba1b16fef9fa6354a3e4ef3574bb1d03552922"
+        " && pip install --no-cache-dir '.[math]'",
+        "rm -rf /tmp/lm-eval",
+    )
+ 
+    # ── Clone project repo ────────────────────────────────────
     .run_commands(
         "git clone https://github.com/TheBlackCat22/distributionally_robust_dpo /repo",
     )
-    .env({"PYTHONPATH": "/repo", "VLLM_CONFIGURE_LOGGING": "0"})
+    .env({
+        "PYTHONPATH": "/repo",
+        "VLLM_CONFIGURE_LOGGING": "0",
+    })
 )
 
+
 # =============================================================================
-# GPU specs
+# GPU specs — Modal 1.x uses plain strings, not modal.gpu objects.
+# Syntax: "TYPE" for 1 GPU, "TYPE:N" for N GPUs.
+# A100 80GB variant is specifically "A100-80GB".
+# Strings are case-insensitive.
 # =============================================================================
 
-# A10G: cheap, sufficient for 1B model generation and ArmoRM scoring
-A10G_SPEC = modal.gpu.A10G(count=1)
-
-# A100 80GB: for 1B/3B training with DeepSpeed ZeRO-2
-A100_SPEC = modal.gpu.A100(size="80GB", count=4)
-
-# H100: for 8B model and large-scale runs
-H100_SPEC = modal.gpu.H100(count=8)
+A10G_SPEC    = "A10G"           # 1x A10G: cheap, for 1B generation & ArmoRM scoring
+A100_SPEC    = "A100-80GB:4"    # 4x A100 80GB: for 1B/3B training with DeepSpeed ZeRO-2
+H100_SPEC    = "H100:8"         # 8x H100: for 8B model and large-scale runs
 
 # =============================================================================
 # App
