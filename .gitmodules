@@ -1,0 +1,3 @@
+[submodule "distributionally_robust_dpo"]
+	path = distributionally_robust_dpo
+	url = https://github.com/TheBlackCat22/distributionally_robust_dpo
