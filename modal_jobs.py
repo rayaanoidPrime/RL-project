@@ -337,6 +337,7 @@ def download_assets():
     _hf_login()
     # The paper's setup.py saves to relative paths; we symlink /repo subdirs
     # to the persistent volume so nothing is lost between runs.
+    
     _run("mkdir -p /vol/models /vol/datasets")
     _run("ln -sfn /vol/models /repo/models")
     _run("ln -sfn /vol/datasets /repo/datasets")
@@ -353,22 +354,63 @@ def download_assets():
     image=BASE_IMAGE,
     secrets=[HF_SECRET],
     volumes={VOLUME_MOUNT: VOLUME},
-    timeout=7200,
+    timeout=10000,
     gpu=A10G_SPEC,
 )
 def generate_completions_1b_armo():
     """
     ArmoRM multi-objective experiment: 2 completions per prompt.
-    Calls the paper's generate_completions.sh directly.
-    Output -> /vol/datasets/helpsteer2_completions_armo
+    Output -> /vol/datasets/helpsteer2_completions
     """
     _hf_login()
     _run("ln -sfn /vol/models /repo/models")
     _run("ln -sfn /vol/datasets /repo/datasets")
     _run("ln -sfn /vol/outputs /repo/outputs 2>/dev/null || true")
+
+    # ── Patch 1: Lower RM micro_batch_size 64 → 4 ─────────────────
+    # ArmoRM is 8B (~16GB weights). On a 22GB A10G there's ~6GB left
+    # for activations. batch=64 needs ~8GB of activations → OOM.
+    # batch=4 uses ~0.5GB → fits with headroom.
+    _run("""sed -i \
+        's/--micro_batch_size 64/--micro_batch_size 16/g' \
+        /repo/generate_completions.sh""")
+    
+    # ---- Patch 2 --------------
+
+    script_path = "/repo/src/generate_completions.py"
+    with open(script_path, "r") as f:
+        src = f.read()
+
+    # These two lines together are the problem:
+    # Line 1: batch apply_chat_template fails on Arrow column data
+    # Line 2: TokensPrompt wrapping + best_of_n repetition (this part is correct)
+    # We collapse both into one comprehension that does all three things correctly.
+    old = (
+        "prompts = tokenizer.apply_chat_template(prompts_data[args.input_key], add_generation_prompt=True)\n"
+        "    prompts = [TokensPrompt(prompt_token_ids=prompt) for prompt in prompts for _ in range(args.best_of_n)]"
+    )
+    new = (
+        "prompts = [\n"
+        "        TokensPrompt(prompt_token_ids=tokenizer.apply_chat_template(\n"
+        "            conv, add_generation_prompt=True, tokenize=True\n"
+        "        ))\n"
+        "        for conv in prompts_data[args.input_key]\n"
+        "        for _ in range(args.best_of_n)\n"
+        "    ]"
+    )
+
+    assert old in src, "Pattern not found — check exact whitespace in the source file"
+    patched = src.replace(old, new, 1)
+
+    with open(script_path, "w") as f:
+        f.write(patched)
+
+    print("Patch applied successfully.")
+
+    # Bug fix: note the space added before --only_test so flags don't merge
     _run(
         "bash generate_completions.sh "
-        "--save_path=datasets/helpsteer2_completions_armo "
+        "--save_path=datasets/helpsteer2_completions "
         "--model_path=models/Llama1b "
         "--best_of_n=2 "
         "--temperature=0.7",
@@ -381,7 +423,7 @@ def generate_completions_1b_armo():
     image=BASE_IMAGE,
     secrets=[HF_SECRET],
     volumes={VOLUME_MOUNT: VOLUME},
-    timeout=14400,
+    timeout=20000,
     gpu=A10G_SPEC,
 )
 def generate_completions_1b_leaderboard():
@@ -419,11 +461,16 @@ def generate_preferences_armo_plot1():
     """Plot 1: ultrafeedback_truthfulness + helpsteer_complexity (50/50)."""
     _run("ln -sfn /vol/models /repo/models")
     _run("ln -sfn /vol/datasets /repo/datasets")
+    # Fix syntax error in paper's code: assert assignment vs equality
+    _run(
+        "sed -i 's/assert weight_sum=1,/assert weight_sum == 1,/' "
+        "/repo/src/generate_preferences.py"
+    )
     _run(
         "python src/generate_preferences.py "
-        "--completions=datasets/helpsteer2_completions_armo "
+        "--completions=datasets/helpsteer2_completions "
         "--output_path=datasets/helpsteer2_prefs_armo_plot1 "
-        "--ultrafeedback_truthfulness=0.5 --helpsteer_complexity=0.5",
+        "--ultrafeedback-truthfulness=0.5 --helpsteer-complexity=0.5",
         cwd="/repo",
     )
     VOLUME.commit()
@@ -440,11 +487,16 @@ def generate_preferences_armo_plot2():
     """Plot 2: ultrafeedback_helpfulness + helpsteer_coherence (50/50)."""
     _run("ln -sfn /vol/models /repo/models")
     _run("ln -sfn /vol/datasets /repo/datasets")
+    # Fix syntax error in paper's code: assert assignment vs equality
+    _run(
+        "sed -i 's/assert weight_sum=1,/assert weight_sum == 1,/' "
+        "/repo/src/generate_preferences.py"
+    )
     _run(
         "python src/generate_preferences.py "
-        "--completions=datasets/helpsteer2_completions_armo "
+        "--completions=datasets/helpsteer2_completions "
         "--output_path=datasets/helpsteer2_prefs_armo_plot2 "
-        "--ultrafeedback_helpfulness=0.5 --helpsteer_coherence=0.5",
+        "--ultrafeedback-helpfulness=0.5 --helpsteer-coherence=0.5",
         cwd="/repo",
     )
     VOLUME.commit()
@@ -461,11 +513,16 @@ def generate_preferences_armo_plot3():
     """Plot 3: helpsteer_correctness + helpsteer_helpfulness (50/50)."""
     _run("ln -sfn /vol/models /repo/models")
     _run("ln -sfn /vol/datasets /repo/datasets")
+    # Fix syntax error in paper's code: assert assignment vs equality
+    _run(
+        "sed -i 's/assert weight_sum=1,/assert weight_sum == 1,/' "
+        "/repo/src/generate_preferences.py"
+    )
     _run(
         "python src/generate_preferences.py "
-        "--completions=datasets/helpsteer2_completions_armo "
+        "--completions=datasets/helpsteer2_completions "
         "--output_path=datasets/helpsteer2_prefs_armo_plot3 "
-        "--helpsteer_correctness=0.5 --helpsteer_helpfulness=0.5",
+        "--helpsteer-correctness=0.5 --helpsteer-helpfulness=0.5",
         cwd="/repo",
     )
     VOLUME.commit()
@@ -531,10 +588,10 @@ def _train(
     timeout=18000,
     gpu=A100_SPEC,
 )
-def train_dpo_1b():
+def train_dpo_1b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard"):
     _train(
         model_path="models/Llama1b",
-        dataset_path="datasets/helpsteer2_prefs_leaderboard",
+        dataset_path=dataset_path,
         save_path="outputs/llama1b_dpo",
         method="dpo",
         gpu_count=4,
@@ -548,10 +605,10 @@ def train_dpo_1b():
     timeout=18000,
     gpu=A100_SPEC,
 )
-def train_kldpo_1b(tau: float = 0.05):
+def train_kldpo_1b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard",tau: float = 0.05):
     _train(
         model_path="models/Llama1b",
-        dataset_path="datasets/helpsteer2_prefs_leaderboard",
+        dataset_path=dataset_path,
         save_path=f"outputs/llama1b_kldpo_tau{tau}",
         method="kldpo",
         extra_flag=f"--kldpo_tau={tau}",
@@ -566,10 +623,10 @@ def train_kldpo_1b(tau: float = 0.05):
     timeout=18000,
     gpu=A100_SPEC,
 )
-def train_wdpo_1b(rho: float = 0.01):
+def train_wdpo_1b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard", rho: float = 0.01):
     _train(
         model_path="models/Llama1b",
-        dataset_path="datasets/helpsteer2_prefs_leaderboard",
+        dataset_path=dataset_path,
         save_path=f"outputs/llama1b_wdpo_rho{rho}",
         method="wdpo",
         extra_flag=f"--wdpo_rho={rho}",
