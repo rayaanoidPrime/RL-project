@@ -559,25 +559,48 @@ def _train(
     model_path: str,
     dataset_path: str,
     save_path: str,
-    method: str,           # "dpo" | "kldpo" | "wdpo"
-    extra_flag: str = "",  # e.g. "--kldpo_tau=0.05"
+    method: str,
+    extra_flag: str = "",
     gpu_count: int = 4,
+    max_epochs: int = 8,
 ):
-    """Internal helper that calls train_alignment.sh."""
     os.environ["SLURM_GPUS_ON_NODE"] = str(gpu_count)
     _run("mkdir -p /vol/outputs")
     _run("ln -sfn /vol/models /repo/models")
     _run("ln -sfn /vol/datasets /repo/datasets")
     _run("ln -sfn /vol/outputs /repo/outputs")
-    flag = extra_flag
-    _run(
-        f"bash train_alignment.sh "
-        f"--model_path={model_path} "
-        f"--dataset_path={dataset_path} "
-        f"--save_path={save_path} "
-        f"{flag}",
-        cwd="/repo",
+
+    micro_train_batch_size = "1" if method == "wdpo" else "4"
+
+    cmd = (
+        f"deepspeed src/train_alignment.py "
+        f"--save_path {save_path} "
+        f"--save_steps 158 "
+        f"--save_hf_ckpt "
+        f"--disable_ds_ckpt "
+        f"--eval_steps 79 "
+        f"--ckpt_path {save_path} "
+        f"--micro_train_batch_size {micro_train_batch_size} "
+        f"--train_batch_size 128 "
+        f"--gradient_checkpointing "
+        f"--zero_stage 2 "
+        f"--bf16 "
+        f"--learning_rate 5.0e-7 "
+        f"--lr_warmup_ratio 0.1 "
+        f"--zpg {gpu_count} "
+        f"--flash_attn "
+        f"--train_task {method} "
+        f"--max_epochs {max_epochs} "
+        f"--beta 0.01 "
+        f"--pretrain {model_path} "
+        f"--dataset json@{dataset_path} "
+        f"--prompt_key prompt "
+        f"--apply_chat_template "
+        f"--max_len 2048 "
+        f"--use_tensorboard {save_path} "
+        f"{extra_flag}"
     )
+    _run(cmd, cwd="/repo")
     VOLUME.commit()
 
 
@@ -588,13 +611,14 @@ def _train(
     timeout=18000,
     gpu=A100_SPEC,
 )
-def train_dpo_1b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard"):
+def train_dpo_1b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard", max_epochs: int = 8):
     _train(
         model_path="models/Llama1b",
         dataset_path=dataset_path,
-        save_path="outputs/llama1b_dpo",
+        save_path=f"outputs/llama1b_dpo_{dataset_path.split('/')[-1]}",
         method="dpo",
         gpu_count=4,
+        max_epochs=max_epochs,
     )
 
 
@@ -605,13 +629,14 @@ def train_dpo_1b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard"):
     timeout=18000,
     gpu=A100_SPEC,
 )
-def train_kldpo_1b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard",tau: float = 0.05):
+def train_kldpo_1b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard",tau: float = 0.05, max_epochs: int = 8):
     _train(
         model_path="models/Llama1b",
         dataset_path=dataset_path,
-        save_path=f"outputs/llama1b_kldpo_tau{tau}",
+        save_path=f"outputs/llama1b_kldpo_tau{tau}_{dataset_path.split('/')[-1]}",
         method="kldpo",
         extra_flag=f"--kldpo_tau={tau}",
+        max_epochs=max_epochs,
         gpu_count=4,
     )
 
@@ -623,13 +648,14 @@ def train_kldpo_1b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard",t
     timeout=18000,
     gpu=A100_SPEC,
 )
-def train_wdpo_1b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard", rho: float = 0.01):
+def train_wdpo_1b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard", rho: float = 0.01, max_epochs: int = 8):
     _train(
         model_path="models/Llama1b",
         dataset_path=dataset_path,
-        save_path=f"outputs/llama1b_wdpo_rho{rho}",
+        save_path=f"outputs/llama1b_wdpo_rho{rho}_{dataset_path.split('/')[-1]}",
         method="wdpo",
         extra_flag=f"--wdpo_rho={rho}",
+        max_epochs=max_epochs,
         gpu_count=4,
     )
 
@@ -643,15 +669,15 @@ def train_wdpo_1b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard", r
     timeout=36000,
     gpu=A100_SPEC,
 )
-def train_dpo_3b():
+def train_dpo_3b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard", max_epochs: int = 8):
     _train(
         model_path="models/Llama3b",
-        dataset_path="datasets/helpsteer2_prefs_leaderboard",
-        save_path="outputs/llama3b_dpo",
+        dataset_path=dataset_path,
+        save_path=f"outputs/llama3b_dpo_{dataset_path.split('/')[-1]}",
         method="dpo",
         gpu_count=4,
+        max_epochs=max_epochs,
     )
-
 
 @app.function(
     image=BASE_IMAGE,
@@ -660,15 +686,17 @@ def train_dpo_3b():
     timeout=36000,
     gpu=A100_SPEC,
 )
-def train_kldpo_3b(tau: float = 0.005):
+def train_kldpo_3b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard", tau: float = 0.005, max_epochs: int = 8):
     _train(
         model_path="models/Llama3b",
-        dataset_path="datasets/helpsteer2_prefs_leaderboard",
-        save_path=f"outputs/llama3b_kldpo_tau{tau}",
+        dataset_path=dataset_path,
+        save_path=f"outputs/llama3b_kldpo_tau{tau}_{dataset_path.split('/')[-1]}",
         method="kldpo",
         extra_flag=f"--kldpo_tau={tau}",
         gpu_count=4,
+        max_epochs=max_epochs,
     )
+
 
 
 @app.function(
@@ -678,15 +706,17 @@ def train_kldpo_3b(tau: float = 0.005):
     timeout=36000,
     gpu=A100_SPEC,
 )
-def train_wdpo_3b(rho: float = 0.005):
+def train_wdpo_3b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard", rho: float = 0.005, max_epochs: int = 8):
     _train(
         model_path="models/Llama3b",
-        dataset_path="datasets/helpsteer2_prefs_leaderboard",
-        save_path=f"outputs/llama3b_wdpo_rho{rho}",
+        dataset_path=dataset_path,
+        save_path=f"outputs/llama3b_wdpo_rho{rho}_{dataset_path.split('/')[-1]}",
         method="wdpo",
         extra_flag=f"--wdpo_rho={rho}",
         gpu_count=4,
+        max_epochs=max_epochs,
     )
+
 
 
 # ---------- 8B (KLDPO only — matches paper) ----------
@@ -698,14 +728,15 @@ def train_wdpo_3b(rho: float = 0.005):
     timeout=72000,
     gpu=H100_SPEC,
 )
-def train_kldpo_8b(tau: float = 0.005):
+def train_kldpo_8b(dataset_path: str = "datasets/helpsteer2_prefs_leaderboard", tau: float = 0.005, max_epochs: int = 8):
     _train(
         model_path="models/Llama8b",
-        dataset_path="datasets/helpsteer2_prefs_leaderboard",
-        save_path=f"outputs/llama8b_kldpo_tau{tau}",
+        dataset_path=dataset_path,
+        save_path=f"outputs/llama8b_kldpo_tau{tau}_{dataset_path.split('/')[-1]}",
         method="kldpo",
         extra_flag=f"--kldpo_tau={tau}",
         gpu_count=8,
+        max_epochs=max_epochs,
     )
 
 
@@ -720,11 +751,10 @@ def train_kldpo_8b(tau: float = 0.005):
     timeout=7200,
     gpu=A10G_SPEC,
 )
-def eval_armo(model_path: str = "outputs/llama1b_kldpo_tau0.05/global_step_316"):
-    """Generate completions for ArmoRM eval (only_test=true)."""
-    _run("ln -sfn /vol/models /repo/models")
+def eval_armo(model_path: str = "outputs/llama1b_kldpo_tau0.05_helpsteer2_prefs_armo_plot1/global_step_316"):
     _run("ln -sfn /vol/datasets /repo/datasets")
     _run("ln -sfn /vol/outputs /repo/outputs")
+    _run("ln -sfn /vol/models /repo/models")
     _run(
         f"bash generate_completions.sh "
         f"--only_test=true "
@@ -748,7 +778,7 @@ def eval_armo(model_path: str = "outputs/llama1b_kldpo_tau0.05/global_step_316")
     timeout=36000,
     gpu=A100_SPEC,   # leaderboard eval script uses 4 GPUs
 )
-def eval_leaderboard(model_path: str = "outputs/llama1b_kldpo_tau0.05/global_step_158"):
+def eval_leaderboard(model_path: str = "outputs/llama1b_kldpo_tau0.05_helpsteer2_prefs_leaderboard/global_step_158"):
     """Run OpenLLM leaderboard v2 eval via the paper's leaderboard_eval.sh."""
     _run("ln -sfn /vol/models /repo/models")
     _run("ln -sfn /vol/datasets /repo/datasets")
