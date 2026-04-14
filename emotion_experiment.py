@@ -309,13 +309,13 @@ def run_emotion_experiment(skip_training: bool = False):
         test_ds_rm  = RewardDataset(test_samples,  tokenizer_rm)
         train_dl_rm = DataLoader(train_ds_rm, batch_size=64, shuffle=True,  num_workers=2)
         test_dl_rm  = DataLoader(test_ds_rm,  batch_size=64, shuffle=False, num_workers=2)
-
+        
+        assert len(train_dl_rm) > 0, "Empty train dataloader"
+        
         optimizer_rm = torch.optim.Adam(
             reward_model.parameters(), lr=5e-5, weight_decay=0.01
         )
         criterion = nn.BCEWithLogitsLoss()
-
-        assert len(train_dl_rm) > 0, "Empty train dataloader"
 
         # ── Resume from latest checkpoint if available ──────────────────
         RM_CKPT_DIR = f"{BASE}/reward_model/checkpoints"
@@ -998,10 +998,11 @@ def run_emotion_experiment(skip_training: bool = False):
 
     ALPHAS = [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
 
-    def eval_model_at_alpha(model_path, mix_fn, alpha):
+    def eval_model_at_alpha(model_path, mix_fn):
         """
         Generate completions from a trained model on the test prompts,
-        score them, return mean reward under mix_fn(alpha).
+        score them once, then return mean reward under mix_fn for every
+        alpha in ALPHAS in a single pass — avoiding 7× redundant inference.
         """
         model = GPT2LMHeadModel.from_pretrained(model_path).to(DEVICE)
         model.eval()
@@ -1022,9 +1023,9 @@ def run_emotion_experiment(skip_training: bool = False):
             text = tokenizer_sft.decode(new_tokens, skip_special_tokens=True)
             all_completions.append(prompt + text)
 
+        # Score once — reuse across all alpha values
         scores = score_texts(all_completions)  # (N, 5)
-        rewards = mix_fn(scores, alpha)
-        return float(np.mean(rewards))
+        return [float(np.mean(mix_fn(scores, alpha))) for alpha in ALPHAS]
 
     # Build results dict: results[mix_type][model_label][alpha] = reward
     results = {
@@ -1061,10 +1062,8 @@ def run_emotion_experiment(skip_training: bool = False):
                 print(f"    Skipping {label} (not trained)")
                 continue
 
-            rewards = []
-            for alpha in ALPHAS:
-                r = eval_model_at_alpha(path, mix_fn, alpha)
-                rewards.append(r)
+            rewards = eval_model_at_alpha(path, mix_fn)
+            for alpha, r in zip(ALPHAS, rewards):
                 print(f"    {label} alpha={alpha:.1f}: {r:.4f}")
             results[mix_type][label] = rewards
 
