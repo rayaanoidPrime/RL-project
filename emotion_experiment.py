@@ -224,6 +224,8 @@ def run_emotion_experiment(skip_training: bool = False):
     test_samples = all_samples[split:]
     print(f"  Train: {len(train_samples)}, Test: {len(test_samples)}")
 
+    # Also keep original single-label texts for SFT and completions generation
+    orig_texts = list(texts)
     # ── Step 1 assertions ────────────────────────────────────────────────
     assert len(orig_texts) > 0, \
         f"[STEP 1] FAILED: No texts loaded from dataset (got {len(orig_texts)})"
@@ -238,8 +240,7 @@ def run_emotion_experiment(skip_training: bool = False):
     print(f"  [STEP 1] ✅ Assertions passed — {len(all_samples)} samples, "
           f"{len(orig_texts)} original texts")
 
-    # Also keep original single-label texts for SFT and completions generation
-    orig_texts = list(texts)
+    
 
     # =========================================================================
     # STEP 2: Train GPT-2 reward model
@@ -840,7 +841,8 @@ def run_emotion_experiment(skip_training: bool = False):
         Saves an epoch-level checkpoint every 5 epochs so that GPU credits
         are not lost if the pipeline crashes mid-run.
         """
-        if os.path.exists(f"{save_path}/pytorch_model.bin"):
+        saved = (os.path.exists(f"{save_path}/pytorch_model.bin") or os.path.exists(f"{save_path}/model.safetensors"))
+        if saved:
             print(f"  Already trained: {save_path}")
             return
 
