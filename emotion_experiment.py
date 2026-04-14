@@ -159,7 +159,9 @@ def run_emotion_experiment(skip_training: bool = False):
     # ── Paths ──────────────────────────────────────────────────────────────
     BASE = "/vol/emotion"
     os.makedirs(f"{BASE}/reward_model", exist_ok=True)
+    os.makedirs(f"{BASE}/reward_model/checkpoints", exist_ok=True)
     os.makedirs(f"{BASE}/sft_model", exist_ok=True)
+    os.makedirs(f"{BASE}/sft_model/checkpoints", exist_ok=True)
     os.makedirs(f"{BASE}/completions", exist_ok=True)
     os.makedirs(f"{BASE}/preferences", exist_ok=True)
     os.makedirs(f"{BASE}/trained_models", exist_ok=True)
@@ -221,6 +223,20 @@ def run_emotion_experiment(skip_training: bool = False):
     train_samples = all_samples[:split]
     test_samples = all_samples[split:]
     print(f"  Train: {len(train_samples)}, Test: {len(test_samples)}")
+
+    # ── Step 1 assertions ────────────────────────────────────────────────
+    assert len(orig_texts) > 0, \
+        f"[STEP 1] FAILED: No texts loaded from dataset (got {len(orig_texts)})"
+    assert len(all_samples) >= 10000, \
+        f"[STEP 1] FAILED: Multi-label dataset too small (got {len(all_samples)}, expected ≥10000)"
+    assert len(train_samples) > 0 and len(test_samples) > 0, \
+        "[STEP 1] FAILED: Train or test split is empty"
+    assert all("text" in s and "labels" in s for s in all_samples[:10]), \
+        "[STEP 1] FAILED: Samples missing 'text' or 'labels' keys"
+    assert all(len(s["labels"]) == 5 for s in all_samples[:10]), \
+        "[STEP 1] FAILED: Label vectors are not 5-dimensional"
+    print(f"  [STEP 1] ✅ Assertions passed — {len(all_samples)} samples, "
+          f"{len(orig_texts)} original texts")
 
     # Also keep original single-label texts for SFT and completions generation
     orig_texts = list(texts)
@@ -287,7 +303,7 @@ def run_emotion_experiment(skip_training: bool = False):
                 "labels": torch.tensor(s["labels"], dtype=torch.float),
             }
 
-    if not reward_model_trained or skip_training is False:
+    if not reward_model_trained and not skip_training:
         print("Training reward model from scratch...")
         reward_model = EmotionRewardModel().to(DEVICE)
         train_ds_rm = RewardDataset(train_samples, tokenizer_rm)
@@ -300,7 +316,20 @@ def run_emotion_experiment(skip_training: bool = False):
         )
         criterion = nn.BCEWithLogitsLoss()
 
-        for epoch in range(8):
+        # ── Resume from latest checkpoint if available ──────────────────
+        RM_CKPT_DIR = f"{BASE}/reward_model/checkpoints"
+        start_epoch_rm = 0
+        for ep in range(7, -1, -1):
+            ckpt_path = f"{RM_CKPT_DIR}/epoch_{ep+1}.pt"
+            if os.path.exists(ckpt_path):
+                ckpt = torch.load(ckpt_path, map_location=DEVICE)
+                reward_model.load_state_dict(ckpt["model"])
+                optimizer_rm.load_state_dict(ckpt["optimizer"])
+                start_epoch_rm = ep + 1
+                print(f"  Resumed reward model from epoch {start_epoch_rm} checkpoint")
+                break
+
+        for epoch in range(start_epoch_rm, 8):
             reward_model.train()
             total_loss = 0
             for batch in tqdm(train_dl_rm, desc=f"RM Epoch {epoch+1}/8"):
@@ -315,6 +344,19 @@ def run_emotion_experiment(skip_training: bool = False):
                 total_loss += loss.item()
             avg = total_loss / len(train_dl_rm)
             print(f"  Epoch {epoch+1}: loss={avg:.4f}")
+
+            # ── Sanity check: loss should not be NaN ────────────────────
+            assert not math.isnan(avg), \
+                f"[STEP 2] FAILED: Reward model loss is NaN at epoch {epoch+1}"
+
+            # ── Per-epoch checkpoint ────────────────────────────────────
+            ckpt_path = f"{RM_CKPT_DIR}/epoch_{epoch+1}.pt"
+            torch.save({"epoch": epoch + 1,
+                        "model": reward_model.state_dict(),
+                        "optimizer": optimizer_rm.state_dict(),
+                        "loss": avg}, ckpt_path)
+            VOLUME.commit()
+            print(f"  Checkpoint saved: {ckpt_path}")
 
         # Eval
         reward_model.eval()
@@ -333,9 +375,18 @@ def run_emotion_experiment(skip_training: bool = False):
         acc = (all_preds == all_labels).float().mean().item()
         print(f"  Test accuracy: {acc:.4f} (paper reports 0.84)")
 
+        # ── Step 2 assertions ────────────────────────────────────────────
+        assert 0.0 <= acc <= 1.0, \
+            f"[STEP 2] FAILED: Reward model accuracy out of range: {acc}"
+        assert acc > 0.5, \
+            (f"[STEP 2] FAILED: Reward model accuracy {acc:.4f} is no better than chance. "
+             "Check data or training setup.")
+        print(f"  [STEP 2] ✅ Assertions passed — accuracy={acc:.4f}")
+
         # Save
         torch.save(reward_model.state_dict(), f"{REWARD_MODEL_PATH}/pytorch_model.bin")
         tokenizer_rm.save_pretrained(REWARD_MODEL_PATH)
+        VOLUME.commit()
         print(f"  Saved reward model to {REWARD_MODEL_PATH}")
     else:
         print("Loading existing reward model...")
@@ -345,6 +396,20 @@ def run_emotion_experiment(skip_training: bool = False):
         )
 
     reward_model.eval()
+
+    # ── Post-load assertion: verify reward model produces valid outputs ──────
+    _test_enc = tokenizer_rm(["test sentence"], return_tensors="pt",
+                              max_length=128, truncation=True, padding="max_length")
+    with torch.no_grad():
+        _test_logits = reward_model(
+            _test_enc["input_ids"].to(DEVICE),
+            _test_enc["attention_mask"].to(DEVICE),
+        )
+    assert _test_logits.shape == (1, 5), \
+        f"[STEP 2] FAILED: Reward model output shape {_test_logits.shape}, expected (1, 5)"
+    assert not torch.isnan(_test_logits).any(), \
+        "[STEP 2] FAILED: Reward model produced NaN logits on test input"
+    print("  [STEP 2] ✅ Reward model output shape and NaN check passed")
 
     # Helper: score a list of texts, returns (N, 5) numpy array of sigmoid outputs
     def score_texts(texts_list, batch_size=64):
@@ -413,7 +478,21 @@ def run_emotion_experiment(skip_training: bool = False):
             num_training_steps=10 * len(sft_dl),
         )
 
-        for epoch in range(10):
+        # ── Resume from latest SFT checkpoint if available ──────────────
+        SFT_CKPT_DIR = f"{BASE}/sft_model/checkpoints"
+        start_epoch_sft = 0
+        for ep in range(9, -1, -1):
+            ckpt_path = f"{SFT_CKPT_DIR}/epoch_{ep+1}.pt"
+            if os.path.exists(ckpt_path):
+                ckpt = torch.load(ckpt_path, map_location=DEVICE)
+                sft_model.load_state_dict(ckpt["model"])
+                optimizer_sft.load_state_dict(ckpt["optimizer"])
+                scheduler_sft.load_state_dict(ckpt["scheduler"])
+                start_epoch_sft = ep + 1
+                print(f"  Resumed SFT from epoch {start_epoch_sft} checkpoint")
+                break
+
+        for epoch in range(start_epoch_sft, 10):
             sft_model.train()
             total_loss = 0
             for batch in tqdm(sft_dl, desc=f"SFT Epoch {epoch+1}/10"):
@@ -428,16 +507,45 @@ def run_emotion_experiment(skip_training: bool = False):
                 optimizer_sft.step()
                 scheduler_sft.step()
                 total_loss += loss.item()
-            print(f"  SFT Epoch {epoch+1}: loss={total_loss/len(sft_dl):.4f}")
+            avg_sft = total_loss / len(sft_dl)
+            print(f"  SFT Epoch {epoch+1}: loss={avg_sft:.4f}")
+
+            # ── Sanity check: loss should not be NaN ────────────────────
+            assert not math.isnan(avg_sft), \
+                f"[STEP 3] FAILED: SFT loss is NaN at epoch {epoch+1}"
+
+            # ── Per-epoch checkpoint ────────────────────────────────────
+            ckpt_path = f"{SFT_CKPT_DIR}/epoch_{epoch+1}.pt"
+            torch.save({"epoch": epoch + 1,
+                        "model": sft_model.state_dict(),
+                        "optimizer": optimizer_sft.state_dict(),
+                        "scheduler": scheduler_sft.state_dict(),
+                        "loss": avg_sft}, ckpt_path)
+            VOLUME.commit()
+            print(f"  Checkpoint saved: {ckpt_path}")
 
         sft_model.save_pretrained(SFT_MODEL_PATH)
         tokenizer_sft.save_pretrained(SFT_MODEL_PATH)
+        VOLUME.commit()
         print(f"  Saved SFT model to {SFT_MODEL_PATH}")
     else:
         print("Loading existing SFT model...")
         sft_model = GPT2LMHeadModel.from_pretrained(SFT_MODEL_PATH).to(DEVICE)
 
     sft_model.eval()
+
+    # ── Step 3 assertions: verify SFT model is sane ──────────────────────────
+    assert os.path.exists(f"{SFT_MODEL_PATH}/pytorch_model.bin") or \
+           os.path.exists(f"{SFT_MODEL_PATH}/model.safetensors"), \
+        f"[STEP 3] FAILED: SFT model weights not found at {SFT_MODEL_PATH}"
+    _sft_enc = tokenizer_sft(["hello world"], return_tensors="pt")
+    with torch.no_grad():
+        _sft_out = sft_model(**{k: v.to(DEVICE) for k, v in _sft_enc.items()})
+    assert _sft_out.logits is not None, \
+        "[STEP 3] FAILED: SFT model forward pass returned no logits"
+    assert not torch.isnan(_sft_out.logits).any(), \
+        "[STEP 3] FAILED: SFT model produced NaN logits"
+    print("  [STEP 3] ✅ SFT model assertions passed")
 
     # =========================================================================
     # STEP 4: Generate completions
@@ -489,12 +597,26 @@ def run_emotion_experiment(skip_training: bool = False):
         with open(COMPLETIONS_PATH, "w") as f:
             for item in completions_data:
                 f.write(json.dumps(item) + "\n")
+        VOLUME.commit()
         print(f"  Saved {len(completions_data)} completion pairs")
     else:
         print("Loading existing completions...")
         with open(COMPLETIONS_PATH) as f:
             completions_data = [json.loads(l) for l in f]
         print(f"  Loaded {len(completions_data)} completion pairs")
+
+    # ── Step 4 assertions ────────────────────────────────────────────────────
+    assert len(completions_data) > 0, \
+        "[STEP 4] FAILED: completions_data is empty"
+    assert all(
+        "prompt" in d and "completion_1" in d and "completion_2" in d
+        for d in completions_data[:20]
+    ), "[STEP 4] FAILED: Completion entries missing required keys"
+    assert all(
+        len(d["completion_1"]) > 0 and len(d["completion_2"]) > 0
+        for d in completions_data[:20]
+    ), "[STEP 4] FAILED: Some completions are empty strings"
+    print(f"  [STEP 4] ✅ Assertions passed — {len(completions_data)} completion pairs")
 
     # =========================================================================
     # STEP 5: Label preferences
@@ -566,6 +688,7 @@ def run_emotion_experiment(skip_training: bool = False):
             for p in prefs_convex: f.write(json.dumps(p) + "\n")
         with open(PREFS_GEOMETRIC_PATH, "w") as f:
             for p in prefs_geo:    f.write(json.dumps(p) + "\n")
+        VOLUME.commit()
         print(f"  Saved {len(prefs_convex)} convex and geometric preference pairs")
     else:
         print("Loading existing preferences...")
@@ -575,6 +698,23 @@ def run_emotion_experiment(skip_training: bool = False):
             prefs_geo = [json.loads(l) for l in f]
         scores_c1 = np.load(f"{BASE}/preferences/scores_c1.npy")
         scores_c2 = np.load(f"{BASE}/preferences/scores_c2.npy")
+
+    # ── Step 5 assertions ────────────────────────────────────────────────────
+    assert len(prefs_convex) > 0, \
+        "[STEP 5] FAILED: prefs_convex is empty"
+    assert len(prefs_geo) > 0, \
+        "[STEP 5] FAILED: prefs_geo is empty"
+    assert len(prefs_convex) == len(prefs_geo), \
+        (f"[STEP 5] FAILED: Convex and geometric preference sets have different lengths "
+         f"({len(prefs_convex)} vs {len(prefs_geo)})")
+    assert all(
+        "chosen" in p and "rejected" in p and "label" in p
+        for p in prefs_convex[:20]
+    ), "[STEP 5] FAILED: Convex preference entries missing required keys"
+    assert scores_c1.shape == scores_c2.shape and scores_c1.ndim == 2 and scores_c1.shape[1] == 5, \
+        f"[STEP 5] FAILED: Unexpected reward score shape: {scores_c1.shape}"
+    print(f"  [STEP 5] ✅ Assertions passed — {len(prefs_convex)} preference pairs, "
+          f"score arrays shape {scores_c1.shape}")
 
     # =========================================================================
     # STEP 6: Train DPO / WDPO / KLDPO on both mixing types
@@ -697,6 +837,8 @@ def run_emotion_experiment(skip_training: bool = False):
         """
         Train one DPO variant. Effective batch = batch_size * grad_accum = 64.
         Single GPU, plain Adam, 12 warmup steps.
+        Saves an epoch-level checkpoint every 5 epochs so that GPU credits
+        are not lost if the pipeline crashes mid-run.
         """
         if os.path.exists(f"{save_path}/pytorch_model.bin"):
             print(f"  Already trained: {save_path}")
@@ -718,7 +860,22 @@ def run_emotion_experiment(skip_training: bool = False):
             optimizer, num_warmup_steps=12, num_training_steps=total_steps
         )
 
-        for epoch in range(epochs):
+        # ── Resume from latest DPO checkpoint if available ──────────────
+        dpo_ckpt_dir = f"{save_path}/checkpoints"
+        os.makedirs(dpo_ckpt_dir, exist_ok=True)
+        start_epoch = 0
+        for ep in range(epochs - 1, -1, -1):
+            ckpt_path = f"{dpo_ckpt_dir}/epoch_{ep+1}.pt"
+            if os.path.exists(ckpt_path):
+                ckpt = torch.load(ckpt_path, map_location=DEVICE)
+                policy.load_state_dict(ckpt["model"])
+                optimizer.load_state_dict(ckpt["optimizer"])
+                scheduler.load_state_dict(ckpt["scheduler"])
+                start_epoch = ep + 1
+                print(f"    Resumed {method} from epoch {start_epoch} checkpoint")
+                break
+
+        for epoch in range(start_epoch, epochs):
             policy.train()
             total_loss = 0
             optimizer.zero_grad()
@@ -741,13 +898,36 @@ def run_emotion_experiment(skip_training: bool = False):
                     scheduler.step()
                     optimizer.zero_grad()
 
+            avg_loss = total_loss / len(loader)
             if (epoch + 1) % 10 == 0:
-                print(f"    Epoch {epoch+1}/{epochs}: loss={total_loss/len(loader):.4f}")
+                print(f"    Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f}")
+
+            # ── NaN guard ───────────────────────────────────────────────
+            assert not math.isnan(avg_loss), \
+                (f"[STEP 6] FAILED: {method} loss is NaN at epoch {epoch+1} "
+                 f"(save_path={save_path})")
+
+            # ── Checkpoint every 5 epochs ───────────────────────────────
+            if (epoch + 1) % 5 == 0:
+                ckpt_path = f"{dpo_ckpt_dir}/epoch_{epoch+1}.pt"
+                torch.save({"epoch": epoch + 1,
+                            "model": policy.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "scheduler": scheduler.state_dict(),
+                            "loss": avg_loss}, ckpt_path)
+                VOLUME.commit()
+                print(f"    Checkpoint saved: {ckpt_path}")
 
         os.makedirs(save_path, exist_ok=True)
         policy.save_pretrained(save_path)
         tokenizer_sft.save_pretrained(save_path)
+        VOLUME.commit()
         print(f"  Saved to {save_path}")
+
+        # ── Step 6 per-model assertion ───────────────────────────────────
+        assert os.path.exists(f"{save_path}/pytorch_model.bin") or \
+               os.path.exists(f"{save_path}/model.safetensors"), \
+            f"[STEP 6] FAILED: Model weights not found after training at {save_path}"
 
     if not skip_training:
         for mix_type, prefs in [("convex", prefs_convex), ("geometric", prefs_geo)]:
@@ -763,6 +943,23 @@ def run_emotion_experiment(skip_training: bool = False):
             for rho in [50, 75, 100]:
                 train_dpo_variant(prefs, "wdpo",
                     f"{BASE}/trained_models/wdpo_{mix_type}_rho{rho}", rho=rho)
+
+        # ── Step 6 assertions: all expected model dirs must exist ────────────
+        expected_models = (
+            [f"dpo_{mt}" for mt in ["convex", "geometric"]] +
+            [f"kldpo_{mt}_tau{tau}" for mt in ["convex", "geometric"]
+                                    for tau in [0.5, 0.75, 1.0]] +
+            [f"wdpo_{mt}_rho{rho}" for mt in ["convex", "geometric"]
+                                   for rho in [50, 75, 100]]
+        )
+        missing = [
+            m for m in expected_models
+            if not (os.path.exists(f"{BASE}/trained_models/{m}/pytorch_model.bin") or
+                    os.path.exists(f"{BASE}/trained_models/{m}/model.safetensors"))
+        ]
+        assert not missing, \
+            f"[STEP 6] FAILED: The following models are missing after training: {missing}"
+        print(f"  [STEP 6] ✅ All {len(expected_models)} DPO variant models confirmed saved")
 
     # =========================================================================
     # STEP 7 & 8: Evaluate and plot Figure 2
