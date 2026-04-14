@@ -178,9 +178,10 @@ def run_emotion_experiment(skip_training: bool = False):
     # ── Emotion labels (drop surprise) ─────────────────────────────────────
     EMOTIONS = ["sadness", "joy", "love", "anger", "fear"]
     EMOTION_TO_IDX = {e: i for i, e in enumerate(EMOTIONS)}
-    # Original dataset label mapping (dair-ai/emotion)
-    # 0=sadness,1=joy,2=love,3=anger,4=fear,5=surprise
-    ORIG_TO_KEEP = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4}  # drop 5=surprise
+    # Original dataset label mapping (dair-ai/emotion):
+    # 0=sadness, 1=joy, 2=love, 3=anger, 4=fear, 5=surprise
+    # Label 5 (surprise) is dropped by the .filter() call below;
+    # the remaining labels 0-4 map directly to EMOTIONS indices.
 
     # =========================================================================
     # STEP 1: Build multi-label Emotion Reward Dataset
@@ -212,8 +213,8 @@ def run_emotion_experiment(skip_training: bool = False):
             label_vec = [0.0] * 5
             for i in idxs:
                 orig_label = labels[i]
-                if orig_label in ORIG_TO_KEEP:
-                    label_vec[ORIG_TO_KEEP[orig_label]] = 1.0
+                if orig_label < 5:          # 0-4 map directly; 5 (surprise) already filtered
+                    label_vec[orig_label] = 1.0
             samples.append({"text": merged_text, "labels": label_vec})
         return samples
 
@@ -260,10 +261,7 @@ def run_emotion_experiment(skip_training: bool = False):
         def __init__(self):
             super().__init__()
             self.gpt2 = GPT2LMHeadModel.from_pretrained("gpt2")
-            # Replace lm_head with a 5-class head
             hidden = self.gpt2.config.n_embd
-            self.gpt2.lm_head = nn.Identity()
-            # We'll grab the last hidden state manually
             self.classifier = nn.Linear(hidden, 5)
 
         def forward(self, input_ids, attention_mask=None):
@@ -316,6 +314,8 @@ def run_emotion_experiment(skip_training: bool = False):
             reward_model.parameters(), lr=5e-5, weight_decay=0.01
         )
         criterion = nn.BCEWithLogitsLoss()
+
+        assert len(train_dl_rm) > 0, "Empty train dataloader"
 
         # ── Resume from latest checkpoint if available ──────────────────
         RM_CKPT_DIR = f"{BASE}/reward_model/checkpoints"
@@ -566,7 +566,8 @@ def run_emotion_experiment(skip_training: bool = False):
         for text in tqdm(prompts_raw[:5000], desc="Generating"):  # cap at 5000 prompts
             # First 4 tokens
             enc = tokenizer_sft(text, return_tensors="pt", truncation=True, max_length=68)
-            prompt_ids = enc["input_ids"][0, :4].unsqueeze(0).to(DEVICE)
+            prompt_len = min(4, enc["input_ids"].shape[1])
+            prompt_ids = enc["input_ids"][0, :prompt_len].unsqueeze(0).to(DEVICE)
 
             two_completions = []
             for _ in range(2):
@@ -731,7 +732,10 @@ def run_emotion_experiment(skip_training: bool = False):
         out = model(input_ids=input_ids, attention_mask=attention_mask)
         logits = out.logits[:, :-1, :]           # (B, T-1, V)
         targets = labels_ids[:, 1:]              # (B, T-1)
-        mask = (targets != tokenizer_sft.pad_token_id).float()
+        # Use the shifted attention mask so that real EOS tokens are NOT masked
+        # out. Comparing against pad_token_id would wrongly zero them because
+        # pad_token_id == eos_token_id for GPT-2.
+        mask = attention_mask[:, 1:].float()
         log_probs = F.log_softmax(logits, dim=-1)
         token_log_probs = log_probs.gather(2, targets.unsqueeze(2)).squeeze(2)
         return (token_log_probs * mask).sum(dim=1)  # (B,)
@@ -753,30 +757,51 @@ def run_emotion_experiment(skip_training: bool = False):
     def wdpo_loss(policy, ref_model, chosen_ids, chosen_mask,
                   rejected_ids, rejected_mask, beta=0.1, rho=50.0):
         """
-        WDPO: DPO loss + gradient regularization penalty.
-        L_W = L_DPO + rho * sqrt(mean(||grad_embed(l)||^2))
-        Approximated as L_DPO + rho * ||grad_embed(L_DPO)||_2
-        per the pointwise upper bound from Appendix F.
+        WDPO: DPO loss + gradient regularisation penalty.
+        L_W = L_DPO + rho * ||grad_embed(L_DPO)||_2
+
+        The gradient is taken w.r.t. the token-embedding matrix so the graph
+        stays connected: we run one forward pass through inputs_embeds (which
+        shares storage with wte.weight) and then differentiate through it.
         """
-        # Need gradients w.r.t. embeddings for the penalty
-        embed = policy.transformer.wte  # word token embeddings
+        assert rho is not None, "wdpo_loss requires rho to be set"
 
-        # Forward with embedding gradient tracking
-        chosen_embed   = embed(chosen_ids.to(DEVICE))
-        rejected_embed = embed(rejected_ids.to(DEVICE))
-        chosen_embed.retain_grad()
-        rejected_embed.retain_grad()
+        embed = policy.transformer.wte  # (V, H)
 
-        # Compute base DPO loss
-        base_loss = dpo_loss(
-            policy, ref_model,
-            chosen_ids, chosen_mask,
-            rejected_ids, rejected_mask, beta,
-        )
+        # Embed inputs while keeping the embedding weight in the graph
+        chosen_embeds   = embed(chosen_ids)    # (B, T, H)
+        rejected_embeds = embed(rejected_ids)  # (B, T, H)
 
-        # Gradient of loss w.r.t. embeddings
+        def forward_log_probs(embeds, mask):
+            """Run GPT-2 forward via inputs_embeds, return per-seq sum log-prob."""
+            out = policy(inputs_embeds=embeds, attention_mask=mask)
+            logits = out.logits[:, :-1, :]                          # (B,T-1,V)
+            # targets come from the original ids (shifted by 1)
+            return logits, mask[:, 1:].float()
+
+        # Policy log-probs (through embeddings so grad is available)
+        c_logits, c_mask_s = forward_log_probs(chosen_embeds,   chosen_mask)
+        r_logits, r_mask_s = forward_log_probs(rejected_embeds, rejected_mask)
+
+        def seq_lp(logits, ids, mask):
+            targets = ids[:, 1:]
+            lp = F.log_softmax(logits, dim=-1)
+            token_lp = lp.gather(2, targets.unsqueeze(2)).squeeze(2)
+            return (token_lp * mask).sum(dim=1)
+
+        pol_chosen   = seq_lp(c_logits, chosen_ids,   c_mask_s)
+        pol_rejected = seq_lp(r_logits, rejected_ids, r_mask_s)
+
+        with torch.no_grad():
+            ref_chosen   = get_log_probs(ref_model, chosen_ids,   chosen_mask,   chosen_ids)
+            ref_rejected = get_log_probs(ref_model, rejected_ids, rejected_mask, rejected_ids)
+
+        log_ratio = (pol_chosen - ref_chosen) - (pol_rejected - ref_rejected)
+        base_loss = -F.logsigmoid(beta * log_ratio).mean()
+
+        # Gradient of base_loss w.r.t. the embedding outputs (connected graph)
         grads = torch.autograd.grad(
-            base_loss, [chosen_embed, rejected_embed],
+            base_loss, [chosen_embeds, rejected_embeds],
             create_graph=True, retain_graph=True,
         )
         grad_norm = torch.stack([g.norm() for g in grads]).mean()
@@ -788,6 +813,7 @@ def run_emotion_experiment(skip_training: bool = False):
         KLDPO: reweight samples by worst-case KL distribution.
         P(i) ∝ exp((1/tau) * (l_i - mean_l))
         """
+        assert tau is not None, "kldpo_loss requires tau to be set"
         with torch.no_grad():
             ref_chosen   = get_log_probs(ref_model, chosen_ids,   chosen_mask,   chosen_ids)
             ref_rejected = get_log_probs(ref_model, rejected_ids, rejected_mask, rejected_ids)
@@ -1043,12 +1069,12 @@ def run_emotion_experiment(skip_training: bool = False):
             results[mix_type][label] = rewards
 
     # Also compute nominal (SFT baseline at alpha_0=0.1)
+    # Score once — results are the same for every alpha value.
+    nominal_scores = score_texts([d["completion_1"] for d in completions_data[:500]])
     for mix_type, mix_fn in mix_fns.items():
-        nominal_rewards = []
-        for alpha in ALPHAS:
-            scores = score_texts([d["completion_1"] for d in completions_data[:500]])
-            r = float(np.mean(mix_fn(scores, alpha)))
-            nominal_rewards.append(r)
+        nominal_rewards = [
+            float(np.mean(mix_fn(nominal_scores, alpha))) for alpha in ALPHAS
+        ]
         results[mix_type]["nominal_0"] = nominal_rewards
 
     # ── Plot ────────────────────────────────────────────────────────────────
