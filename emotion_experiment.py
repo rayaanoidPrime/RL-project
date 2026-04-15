@@ -129,7 +129,7 @@ def smoke_test():
 
 @app.function(
     image=EMOTION_IMAGE,
-    gpu="A10G",
+    gpu="L40S",
     volumes={VOLUME_MOUNT: VOLUME},
     timeout=36000,  # ~10 hours worst case; typically 4-6h
 )
@@ -143,6 +143,10 @@ def run_emotion_experiment(skip_training: bool = False):
     import random
     import numpy as np
     import torch
+
+    # ── Memory: tell the CUDA allocator to use expandable segments to reduce
+    # fragmentation (recommended in the OOM error message).
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     import torch.nn as nn
     import torch.nn.functional as F
     from torch.utils.data import Dataset, DataLoader
@@ -305,10 +309,13 @@ def run_emotion_experiment(skip_training: bool = False):
     if not reward_model_trained and not skip_training:
         print("Training reward model from scratch...")
         reward_model = EmotionRewardModel().to(DEVICE)
+        # Gradient checkpointing: recompute activations on backward instead of
+        # storing them — halves activation memory at the cost of ~20% more compute.
+        reward_model.gpt2.gradient_checkpointing_enable()
         train_ds_rm = RewardDataset(train_samples, tokenizer_rm)
         test_ds_rm  = RewardDataset(test_samples,  tokenizer_rm)
-        train_dl_rm = DataLoader(train_ds_rm, batch_size=64, shuffle=True,  num_workers=2)
-        test_dl_rm  = DataLoader(test_ds_rm,  batch_size=64, shuffle=False, num_workers=2)
+        train_dl_rm = DataLoader(train_ds_rm, batch_size=16, shuffle=True,  num_workers=2)
+        test_dl_rm  = DataLoader(test_ds_rm,  batch_size=16, shuffle=False, num_workers=2)
         
         assert len(train_dl_rm) > 0, "Empty train dataloader"
         
@@ -466,8 +473,9 @@ def run_emotion_experiment(skip_training: bool = False):
     if not sft_done:
         print("Training SFT model...")
         sft_model = GPT2LMHeadModel.from_pretrained("gpt2").to(DEVICE)
+        sft_model.gradient_checkpointing_enable()
         sft_ds = SFTDataset(orig_texts, tokenizer_sft)
-        sft_dl = DataLoader(sft_ds, batch_size=64, shuffle=True, num_workers=2)
+        sft_dl = DataLoader(sft_ds, batch_size=16, shuffle=True, num_workers=2)
 
         optimizer_sft = torch.optim.Adam(
             sft_model.parameters(), lr=5e-7
@@ -534,6 +542,8 @@ def run_emotion_experiment(skip_training: bool = False):
         sft_model = GPT2LMHeadModel.from_pretrained(SFT_MODEL_PATH).to(DEVICE)
 
     sft_model.eval()
+    torch.cuda.empty_cache()
+    print("  CUDA cache cleared after SFT")
 
     # ── Step 3 assertions: verify SFT model is sane ──────────────────────────
     assert os.path.exists(f"{SFT_MODEL_PATH}/pytorch_model.bin") or \
@@ -725,6 +735,12 @@ def run_emotion_experiment(skip_training: bool = False):
     print("STEP 6: Training DPO / WDPO / KLDPO (40 epochs)")
     print("="*60)
 
+    # ── Free VRAM before DPO: move reward model to CPU — it is not needed
+    # again until evaluation (Step 7).  This alone saves ~500 MB.
+    reward_model.cpu()
+    torch.cuda.empty_cache()
+    print("  Moved reward model to CPU to free VRAM for DPO training")
+
     # ── DPO loss helpers ────────────────────────────────────────────────────
 
     def get_log_probs(model, input_ids, attention_mask, labels_ids):
@@ -859,13 +875,21 @@ def run_emotion_experiment(skip_training: bool = False):
     def train_dpo_variant(
         prefs, method, save_path,
         beta=0.1, rho=None, tau=None,
-        epochs=40, batch_size=32, grad_accum=2, lr=5e-7,
+        epochs=40, batch_size=8, grad_accum=8, lr=5e-7,
     ):
         """
         Train one DPO variant. Effective batch = batch_size * grad_accum = 64.
         Single GPU, plain Adam, 12 warmup steps.
         Saves an epoch-level checkpoint every 5 epochs so that GPU credits
         are not lost if the pipeline crashes mid-run.
+
+        Memory notes
+        ------------
+        * batch_size reduced to 8 (from 32); grad_accum raised to 8 so the
+          effective batch size stays at 64.
+        * WDPO uses create_graph=True (second-order graph) which is ~3-4×
+          more memory than DPO — the smaller mini-batch is critical for it.
+        * policy has gradient_checkpointing enabled to halve activation memory.
         """
         saved = (os.path.exists(f"{save_path}/pytorch_model.bin") or os.path.exists(f"{save_path}/model.safetensors"))
         if saved:
@@ -936,7 +960,7 @@ def run_emotion_experiment(skip_training: bool = False):
                  f"(save_path={save_path})")
 
             # ── Checkpoint every 5 epochs ───────────────────────────────
-            if (epoch + 1) % 5 == 0:
+            if (epoch + 1) % 20 == 0:
                 ckpt_path = f"{dpo_ckpt_dir}/epoch_{epoch+1}.pt"
                 torch.save({"epoch": epoch + 1,
                             "model": policy.state_dict(),
@@ -952,6 +976,10 @@ def run_emotion_experiment(skip_training: bool = False):
         VOLUME.commit()
         print(f"  Saved to {save_path}")
 
+        # Free GPU memory immediately so the next variant starts with a clean slate.
+        del policy, ref_model
+        torch.cuda.empty_cache()
+
         # ── Step 6 per-model assertion ───────────────────────────────────
         assert os.path.exists(f"{save_path}/pytorch_model.bin") or \
                os.path.exists(f"{save_path}/model.safetensors"), \
@@ -964,11 +992,11 @@ def run_emotion_experiment(skip_training: bool = False):
             train_dpo_variant(prefs, "dpo",
                 f"{BASE}/trained_models/dpo_{mix_type}")
 
-            for tau in [0.5, 0.75, 1.0]:
+            for tau in [ 0.75, 1.0]: # add 0.5 , TODO
                 train_dpo_variant(prefs, "kldpo",
                     f"{BASE}/trained_models/kldpo_{mix_type}_tau{tau}", tau=tau)
 
-            for rho in [50, 75, 100]:
+            for rho in [ 75, 100]: # Add 50 TODO
                 train_dpo_variant(prefs, "wdpo",
                     f"{BASE}/trained_models/wdpo_{mix_type}_rho{rho}", rho=rho)
 
@@ -998,6 +1026,11 @@ def run_emotion_experiment(skip_training: bool = False):
 
     ALPHAS = [0.0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
 
+    # Reward model was offloaded to CPU before DPO — bring it back for scoring.
+    reward_model.to(DEVICE)
+    torch.cuda.empty_cache()
+    print("  Moved reward model back to GPU for evaluation")
+
     def eval_model_at_alpha(model_path, mix_fn):
         """
         Generate completions from a trained model on the test prompts,
@@ -1025,7 +1058,12 @@ def run_emotion_experiment(skip_training: bool = False):
 
         # Score once — reuse across all alpha values
         scores = score_texts(all_completions)  # (N, 5)
-        return [float(np.mean(mix_fn(scores, alpha))) for alpha in ALPHAS]
+        result = [float(np.mean(mix_fn(scores, alpha))) for alpha in ALPHAS]
+
+        # Free the eval model immediately so VRAM is available for the next one.
+        del model
+        torch.cuda.empty_cache()
+        return result
 
     # Build results dict: results[mix_type][model_label][alpha] = reward
     results = {
@@ -1058,7 +1096,7 @@ def run_emotion_experiment(skip_training: bool = False):
             elif method == "wdpo":
                 path = f"{BASE}/trained_models/wdpo_{mix_type}_rho{rho}"
 
-            if not os.path.exists(f"{path}/pytorch_model.bin"):
+            if not os.path.exists(f"{path}/pytorch_model.bin") and not os.path.exists(f"{path}/model.safetensors"):
                 print(f"    Skipping {label} (not trained)")
                 continue
 
