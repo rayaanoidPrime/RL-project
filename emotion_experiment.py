@@ -789,8 +789,18 @@ def run_emotion_experiment(skip_training: bool = False):
         rejected_embeds = embed(rejected_ids)  # (B, T, H)
 
         def forward_log_probs(embeds, mask):
-            """Run GPT-2 forward via inputs_embeds, return per-seq sum log-prob."""
-            out = policy(inputs_embeds=embeds, attention_mask=mask)
+            """Run GPT-2 forward via inputs_embeds, return per-seq sum log-prob.
+
+            Force the math SDPA backend so that create_graph=True in the
+            autograd.grad call below works correctly.  The flash and
+            efficient-attention kernels have no second-order backward pass
+            (RuntimeError: derivative for
+            aten::_scaled_dot_product_efficient_attention_backward is not
+            implemented), but the math backend does.
+            """
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+            with sdpa_kernel(SDPBackend.MATH):
+                out = policy(inputs_embeds=embeds, attention_mask=mask)
             logits = out.logits[:, :-1, :]                          # (B,T-1,V)
             # targets come from the original ids (shifted by 1)
             return logits, mask[:, 1:].float()
@@ -931,7 +941,8 @@ def run_emotion_experiment(skip_training: bool = False):
             policy.train()
             total_loss = 0
             optimizer.zero_grad()
-            for step, batch in enumerate(loader):
+            pbar = tqdm(loader, desc=f"    {method} epoch {epoch+1}/{epochs}", leave=False)
+            for step, batch in enumerate(pbar):
                 c_ids, c_mask, r_ids, r_mask = [x.to(DEVICE) for x in batch]
 
                 if method == "dpo":
@@ -950,9 +961,11 @@ def run_emotion_experiment(skip_training: bool = False):
                     scheduler.step()
                     optimizer.zero_grad()
 
+                pbar.set_postfix(loss=f"{loss.item():.4f}")
+
             avg_loss = total_loss / len(loader)
-            if (epoch + 1) % 10 == 0:
-                print(f"    Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f}")
+            # Log every epoch — no more long silent stretches
+            print(f"    Epoch {epoch+1}/{epochs}: loss={avg_loss:.4f}")
 
             # ── NaN guard ───────────────────────────────────────────────
             assert not math.isnan(avg_loss), \
